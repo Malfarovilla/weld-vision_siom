@@ -2575,7 +2575,7 @@ function agregarPaso(t) {
 
 
 // ============================================================================
-// PUENTE WEBRTC CELULAR -> PC (SEÑALIZACIÓN HTTPS SIN LIBRERÍAS EXTERNAS)
+// PUENTE WEBRTC CELULAR -> PC (SEÑALIZACIÓN HTTPS CON CHUNKING <= 2KB, 0 LIBRERÍAS)
 // ============================================================================
 const RTC_SIGNAL_BASE = "https://ntfy.sh/siom-wv-rtc-";
 const RTC_ICE_CFG = {
@@ -2588,7 +2588,8 @@ const RTC_ICE_CFG = {
 let rtcPc = null, rtcEs = null, rtcLocalStream = null;
 let rtcRol = "pc", rtcSala = "", rtcSid = Math.random().toString(36).slice(2, 9);
 let rtcFacing = "environment", rtcActivo = false, rtcRemoteSid = null;
-let rtcOfferCache = null, rtcConnectedOnce = false;
+let rtcOfferCache = null, rtcConnectedOnce = false, rtcRetryTimer = null;
+let rtcChunkBuf = {};
 
 function rtcLog(msg, color = "#e2e8f0") {
   const el = document.getElementById("rtc-status");
@@ -2638,13 +2639,50 @@ async function copiarLinkCelular() {
   }
 }
 
+// Envía mensajes grandes (SDP > 4KB) divididos en paquetes seguros <= 2KB para que ntfy.sh no los vuelva adjunto
 async function rtcPublicar(sala, obj) {
-  const body = JSON.stringify({ ...obj, sid: rtcSid, ts: Date.now() });
-  const r = await fetch(RTC_SIGNAL_BASE + sala, {
-    method: "POST",
-    body
-  });
-  if (!r.ok) throw new Error("Error señalización HTTPS (" + r.status + ")");
+  const raw = JSON.stringify({ ...obj, sid: rtcSid, ts: Date.now() });
+  const MAX_CHUNK = 1900;
+  if (raw.length <= MAX_CHUNK) {
+    const r = await fetch(RTC_SIGNAL_BASE + sala, { method: "POST", body: raw });
+    if (!r.ok) throw new Error("Error señalización HTTPS (" + r.status + ")");
+    return;
+  }
+  const cid = Math.random().toString(36).slice(2, 8);
+  const total = Math.ceil(raw.length / MAX_CHUNK);
+  for (let i = 0; i < total; i++) {
+    const chunkPayload = JSON.stringify({
+      _ck: 1, sid: rtcSid, cid, i, n: total,
+      d: raw.slice(i * MAX_CHUNK, (i + 1) * MAX_CHUNK)
+    });
+    const r = await fetch(RTC_SIGNAL_BASE + sala, { method: "POST", body: chunkPayload });
+    if (!r.ok) throw new Error("Error señalización chunk (" + r.status + ")");
+    if (i < total - 1) await new Promise(res => setTimeout(res, 75));
+  }
+}
+
+function rtcReensamblar(envData) {
+  try {
+    const env = JSON.parse(envData);
+    if (!env.message || env.message[0] !== "{") return null;
+    const msg = JSON.parse(env.message);
+    if (!msg || msg.sid === rtcSid) return null;
+    if (msg._ck === 1) {
+      let b = rtcChunkBuf[msg.cid];
+      if (!b) b = rtcChunkBuf[msg.cid] = { n: msg.n, got: 0, parts: new Array(msg.n), ts: Date.now() };
+      if (b.parts[msg.i] === undefined) { b.parts[msg.i] = msg.d; b.got++; }
+      if (b.got === b.n) {
+        const joined = b.parts.join("");
+        delete rtcChunkBuf[msg.cid];
+        const fullMsg = JSON.parse(joined);
+        return (fullMsg && fullMsg.sid !== rtcSid) ? fullMsg : null;
+      }
+      return null;
+    }
+    return msg;
+  } catch (_) {
+    return null;
+  }
 }
 
 function esperarIceCompleto(pc, timeoutMs = 2600) {
@@ -2660,12 +2698,13 @@ function esperarIceCompleto(pc, timeoutMs = 2600) {
 }
 
 function limpiarSoloConexionRTC() {
+  if (rtcRetryTimer) { clearInterval(rtcRetryTimer); rtcRetryTimer = null; }
   if (rtcEs) { try { rtcEs.close(); } catch (_) {} rtcEs = null; }
   if (rtcPc) { try { rtcPc.close(); } catch (_) {} rtcPc = null; }
   if (rtcLocalStream) { rtcLocalStream.getTracks().forEach(t => t.stop()); rtcLocalStream = null; }
   const vLoc = document.getElementById("vid-rtc-local");
   if (vLoc) { vLoc.srcObject = null; vLoc.style.display = "none"; }
-  rtcOfferCache = null; rtcRemoteSid = null; rtcConnectedOnce = false;
+  rtcOfferCache = null; rtcRemoteSid = null; rtcConnectedOnce = false; rtcChunkBuf = {};
 }
 
 function cerrarWebRTC() {
@@ -2689,6 +2728,7 @@ function cerrarWebRTC() {
 async function iniciarReceptorPC() {
   if (!rtcSala) generarNuevaSalaPC();
   if (modoCamara) { modoCamara = false; detenerCamara(); actualizarUIBotonCamara(); }
+  mostrarBannerCamara("");
   limpiarSoloConexionRTC();
   rtcActivo = true;
   document.getElementById("rtc-bar-live").classList.add("show");
@@ -2696,16 +2736,16 @@ async function iniciarReceptorPC() {
   if (btn) { btn.className = "btn rtc-on"; btn.innerHTML = `&#128225; WebRTC Sala ${rtcSala}`; }
   rtcLog(`&#128993; PC escuchando en Sala <b>${rtcSala}</b>... Abre el link en tu celular y pulsa "Enviar Cámara Trasera".`, "#fde68a");
 
-  rtcEs = new EventSource(RTC_SIGNAL_BASE + rtcSala + "/sse?since=15s");
+  rtcEs = new EventSource(RTC_SIGNAL_BASE + rtcSala + "/sse");
+  rtcEs.onopen = () => {
+    rtcPublicar(rtcSala, { type: "pc_ready" }).catch(() => {});
+  };
   rtcEs.onmessage = async (ev) => {
+    const msg = rtcReensamblar(ev.data);
+    if (!msg) return;
     try {
-      const env = JSON.parse(ev.data);
-      if (!env.message) return;
-      const msg = JSON.parse(env.message);
-      if (!msg || msg.sid === rtcSid) return;
-
       if (msg.type === "offer") {
-        rtcLog(`&#128309; Celular detectado en Sala <b>${rtcSala}</b>. Negociando video en vivo...`, "#7dd3fc");
+        rtcLog(`&#128309; Oferta recibida del celular (Sala <b>${rtcSala}</b>). Negociando video en vivo...`, "#7dd3fc");
         rtcRemoteSid = msg.sid;
         if (rtcPc) { try { rtcPc.close(); } catch (_) {} }
         rtcPc = new RTCPeerConnection(RTC_ICE_CFG);
@@ -2725,6 +2765,7 @@ async function iniciarReceptorPC() {
           try { await v.play(); } catch (_) {}
           modoCamara = true;
           camCongelada = false;
+          mostrarBannerCamara("");
           actualizarUIBotonCamara();
           actualizarBotonCongelar();
           rtcConnectedOnce = true;
@@ -2739,7 +2780,7 @@ async function iniciarReceptorPC() {
           if (st === "connected" || st === "completed") {
             rtcLog(`&#128994; <b>CONECTADO EN VIVO (Celular &#8594; PC)</b> — Sala ${rtcSala}.`, "#6ee7b7");
           } else if (st === "failed" || st === "disconnected") {
-            rtcLog(`&#128308; Conexión WebRTC interrumpida (${st}). Si estás en WiFi universitario, prueba compartir Hotspot desde el celular y reconectar.`, "#fca5a5");
+            rtcLog(`&#128308; Enlace WebRTC caído (${st}). Si estás en WiFi con firewall, conecta tu PC al Hotspot del celular y reconecta.`, "#fca5a5");
           }
         };
 
@@ -2748,22 +2789,20 @@ async function iniciarReceptorPC() {
         await rtcPc.setLocalDescription(answer);
         await esperarIceCompleto(rtcPc, 2400);
         await rtcPublicar(rtcSala, { type: "answer", to: msg.sid, sdp: rtcPc.localDescription.sdp });
+        rtcLog(`&#128309; Respuesta enviada al celular (Sala <b>${rtcSala}</b>). Esperando trama de video...`, "#7dd3fc");
       } else if (msg.type === "ice" && msg.to === rtcSid && rtcPc && msg.cand) {
         try { await rtcPc.addIceCandidate(msg.cand); } catch (_) {}
       }
-    } catch (_) {}
+    } catch (err) {
+      rtcLog(`&#128308; Error WebRTC en PC: ${err.message}`, "#fca5a5");
+    }
   };
 
   rtcEs.onerror = () => {
     if (rtcActivo && !rtcConnectedOnce) {
-      rtcLog(`&#9888; Reconectando canal de señalización HTTPS (Sala ${rtcSala})...`, "#fde68a");
+      rtcLog(`&#9888; Reconectando señalización HTTPS (Sala ${rtcSala})...`, "#fde68a");
     }
   };
-
-  // Avisa al celular por si ya estaba esperando en la misma sala
-  rtcPublicar(rtcSala, { type: "pc_ready" }).catch(err => {
-    rtcLog(`&#128308; No hay acceso a señalización HTTPS (${err.message}). Verifica conexión a internet.`, "#fca5a5");
-  });
 }
 
 async function iniciarEmisorCelular() {
@@ -2813,6 +2852,7 @@ async function iniciarEmisorCelular() {
       const st = rtcPc ? rtcPc.iceConnectionState : "closed";
       if (st === "connected" || st === "completed") {
         rtcConnectedOnce = true;
+        if (rtcRetryTimer) { clearInterval(rtcRetryTimer); rtcRetryTimer = null; }
         rtcLog(`&#128994; <b>TRANSMITIENDO EN VIVO AL PC</b> — Sala ${rtcSala} (${rtcFacing === "environment" ? "Trasera" : "Frontal"}).`, "#6ee7b7");
       } else if (st === "failed" || st === "disconnected") {
         rtcLog(`&#128308; Enlace caído (${st}). Si el WiFi bloquea WebRTC, activa el Hotspot del celular y conecta el PC.`, "#fca5a5");
@@ -2825,29 +2865,41 @@ async function iniciarEmisorCelular() {
     await esperarIceCompleto(rtcPc, 2400);
     rtcOfferCache = rtcPc.localDescription.sdp;
 
-    rtcEs = new EventSource(RTC_SIGNAL_BASE + rtcSala + "/sse?since=10s");
+    let answerAplicada = false;
+    rtcEs = new EventSource(RTC_SIGNAL_BASE + rtcSala + "/sse");
     rtcEs.onmessage = async (ev) => {
+      const msg = rtcReensamblar(ev.data);
+      if (!msg) return;
       try {
-        const env = JSON.parse(ev.data);
-        if (!env.message) return;
-        const msg = JSON.parse(env.message);
-        if (!msg || msg.sid === rtcSid) return;
-
-        if (msg.type === "answer" && msg.to === rtcSid && rtcPc && rtcPc.signalingState === "have-local-offer") {
+        if (msg.type === "answer" && msg.to === rtcSid && rtcPc && !answerAplicada) {
+          answerAplicada = true;
           rtcRemoteSid = msg.sid;
+          if (rtcRetryTimer) { clearInterval(rtcRetryTimer); rtcRetryTimer = null; }
           await rtcPc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
-          rtcLog(`&#128994; Respuesta del PC recibida. Iniciando transmisión de video...`, "#6ee7b7");
-        } else if (msg.type === "pc_ready" && !rtcConnectedOnce && rtcOfferCache) {
-          // El PC se conectó después: reenviamos nuestra oferta automáticamente
+          rtcLog(`&#128994; Respuesta del PC recibida. Conectando video en vivo...`, "#6ee7b7");
+        } else if (msg.type === "pc_ready" && !answerAplicada && rtcOfferCache) {
           rtcPublicar(rtcSala, { type: "offer", sdp: rtcOfferCache }).catch(() => {});
         } else if (msg.type === "ice" && msg.to === rtcSid && rtcPc && msg.cand) {
           try { await rtcPc.addIceCandidate(msg.cand); } catch (_) {}
         }
-      } catch (_) {}
+      } catch (err) {
+        rtcLog(`&#128308; Error WebRTC en celular: ${err.message}`, "#fca5a5");
+      }
     };
 
+    await new Promise(res => setTimeout(res, 350));
     await rtcPublicar(rtcSala, { type: "offer", sdp: rtcOfferCache });
-    rtcLog(`&#128993; Oferta enviada a Sala <b>${rtcSala}</b>. Esperando al PC Receptor...`, "#fde68a");
+    rtcLog(`&#128993; Oferta enviada a Sala <b>${rtcSala}</b>. Esperando respuesta del PC...`, "#fde68a");
+
+    // Reintento automático cada 4 s (máx. 4 veces) por si el PC aún no abría la sala
+    let tries = 0;
+    rtcRetryTimer = setInterval(() => {
+      if (!rtcActivo || answerAplicada || tries >= 4) {
+        clearInterval(rtcRetryTimer); rtcRetryTimer = null; return;
+      }
+      tries++;
+      rtcPublicar(rtcSala, { type: "offer", sdp: rtcOfferCache }).catch(() => {});
+    }, 4000);
   } catch (err) {
     rtcLog(`&#128308; Error al iniciar cámara emisora: ${err.message}`, "#fca5a5");
   }
