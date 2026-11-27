@@ -2575,9 +2575,13 @@ function agregarPaso(t) {
 
 
 // ============================================================================
-// PUENTE WEBRTC CELULAR -> PC (SEÑALIZACIÓN HTTPS <= 2KB, SIN SPAM ICE, AUTO-SYNC)
+// PUENTE WEBRTC CELULAR -> PC (MQTT SOBRE WSS PURO: 0 LIBRERÍAS, 0 ERROR 429)
 // ============================================================================
-const RTC_SIGNAL_BASE = "https://ntfy.sh/siom-wv-rtc-";
+const RTC_MQTT_BROKERS = [
+  "wss://broker.emqx.io:8084/mqtt",
+  "wss://broker.hivemq.com:8884/mqtt",
+  "wss://test.mosquitto.org:8081/"
+];
 const RTC_ICE_CFG = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
@@ -2585,11 +2589,138 @@ const RTC_ICE_CFG = {
     { urls: "stun:stun.cloudflare.com:3478" }
   ]
 };
-let rtcPc = null, rtcEs = null, rtcLocalStream = null;
+
+// Cliente MQTT v3.1.1 minimalista en JS puro sobre WebSocket seguro (WSS) — sin límites 4KB ni 429
+class MiniMqttWss {
+  constructor(topic, onMsg, onReady, onErr) {
+    this.topic = topic;
+    this.onMsg = onMsg;
+    this.onReady = onReady;
+    this.onErr = onErr;
+    this.ws = null;
+    this.pingId = null;
+    this.closed = false;
+    this.ready = false;
+    this.queue = [];
+    this.enc = new TextEncoder();
+    this.dec = new TextDecoder();
+    this._connectIdx(0);
+  }
+  _encLen(n) {
+    const out = [];
+    do { let b = n & 127; n >>= 7; if (n > 0) b |= 128; out.push(b); } while (n > 0);
+    return out;
+  }
+  _encStr(str) {
+    const b = this.enc.encode(str);
+    const out = new Uint8Array(2 + b.length);
+    out[0] = (b.length >> 8) & 255; out[1] = b.length & 255;
+    out.set(b, 2);
+    return out;
+  }
+  _pkt(typeByte, bodyParts) {
+    let bodyLen = 0;
+    for (const p of bodyParts) bodyLen += p.length;
+    const lenB = this._encLen(bodyLen);
+    const pkt = new Uint8Array(1 + lenB.length + bodyLen);
+    pkt[0] = typeByte;
+    pkt.set(lenB, 1);
+    let off = 1 + lenB.length;
+    for (const p of bodyParts) { pkt.set(p, off); off += p.length; }
+    return pkt;
+  }
+  _connectIdx(idx) {
+    if (this.closed) return;
+    if (idx >= RTC_MQTT_BROKERS.length) {
+      if (this.onErr) this.onErr("No se pudo conectar a ningún broker WSS (verifica internet/firewall)");
+      return;
+    }
+    const url = RTC_MQTT_BROKERS[idx];
+    let settled = false;
+    const failOver = () => {
+      if (settled || this.closed) return;
+      settled = true;
+      try { if (this.ws) this.ws.close(); } catch (_) {}
+      this._connectIdx(idx + 1);
+    };
+    const timer = setTimeout(failOver, 4500);
+    try {
+      const ws = new WebSocket(url, ["mqtt"]);
+      ws.binaryType = "arraybuffer";
+      this.ws = ws;
+      ws.onopen = () => {
+        if (this.closed) { ws.close(); return; }
+        const vh = new Uint8Array([0, 4, 77, 81, 84, 84, 4, 2, 0, 60]);
+        const cid = this._encStr("siom_" + Math.random().toString(36).slice(2, 10));
+        ws.send(this._pkt(0x10, [vh, cid]));
+      };
+      ws.onmessage = (ev) => {
+        const buf = new Uint8Array(ev.data);
+        let pos = 0;
+        while (pos < buf.length) {
+          const hdr = buf[pos++];
+          let mult = 1, rem = 0, b = 0;
+          do {
+            if (pos >= buf.length) return;
+            b = buf[pos++];
+            rem += (b & 127) * mult;
+            mult *= 128;
+          } while ((b & 128) !== 0);
+          const pktEnd = pos + rem;
+          const pType = hdr & 0xF0;
+          if (pType === 0x20) { // CONNACK
+            clearTimeout(timer);
+            settled = true;
+            // Suscribir al tópico de la sala
+            const pid = new Uint8Array([0, 1]);
+            const tEnc = this._encStr(this.topic);
+            ws.send(this._pkt(0x82, [pid, tEnc, new Uint8Array([0])]));
+            this.pingId = setInterval(() => {
+              if (this.ws && this.ws.readyState === 1) this.ws.send(new Uint8Array([0xC0, 0x00]));
+            }, 25000);
+          } else if (pType === 0x90) { // SUBACK -> listo para publicar/recibir
+            this.ready = true;
+            while (this.queue.length) this.publish(this.queue.shift());
+            if (this.onReady) this.onReady(url);
+          } else if (pType === 0x30) { // PUBLISH entrante
+            const tLen = (buf[pos] << 8) | buf[pos + 1];
+            let pOff = pos + 2 + tLen;
+            if ((hdr & 0x06) !== 0) pOff += 2; // QoS > 0 packet id
+            const payload = this.dec.decode(buf.subarray(pOff, pktEnd));
+            if (this.onMsg) this.onMsg(payload);
+          }
+          pos = pktEnd;
+        }
+      };
+      ws.onerror = () => { clearTimeout(timer); failOver(); };
+      ws.onclose = () => { clearTimeout(timer); if (!settled) failOver(); };
+    } catch (_) {
+      clearTimeout(timer);
+      failOver();
+    }
+  }
+  publish(text) {
+    if (this.closed) return;
+    if (!this.ready || !this.ws || this.ws.readyState !== 1) {
+      this.queue.push(text);
+      return;
+    }
+    const tEnc = this._encStr(this.topic);
+    const pBytes = this.enc.encode(text);
+    this.ws.send(this._pkt(0x30, [tEnc, pBytes]));
+  }
+  close() {
+    this.closed = true;
+    this.ready = false;
+    if (this.pingId) { clearInterval(this.pingId); this.pingId = null; }
+    if (this.ws) { try { this.ws.close(); } catch (_) {} this.ws = null; }
+  }
+}
+
+let rtcPc = null, rtcMqtt = null, rtcLocalStream = null;
 let rtcRol = "pc", rtcSala = "", rtcSid = Math.random().toString(36).slice(2, 9);
 let rtcFacing = "environment", rtcActivo = false;
 let rtcOfferCache = null, rtcConnectedOnce = false, rtcRetryTimer = null;
-let rtcChunkBuf = {};
 
 function rtcLog(msg, color = "#e2e8f0") {
   const el = document.getElementById("rtc-status");
@@ -2604,7 +2735,6 @@ function abrirModalRTC(autoRol = null) {
   else if (!rtcActivo) setRtcRol(esMovil() ? "cel" : "pc");
   if (rtcRol === "pc") {
     if (!rtcSala) generarNuevaSalaPC(false);
-    // Inicia escucha automáticamente en el código visible para que escribir el código en el celular funcione al instante
     if (!rtcActivo) iniciarReceptorPC();
   }
 }
@@ -2648,59 +2778,18 @@ async function copiarLinkCelular() {
   const url = obtenerLinkDirectoCelular(rtcSala);
   try {
     await navigator.clipboard.writeText(url);
-    rtcLog(`&#9989; Enlace copiado para Sala <b>${rtcSala}</b> (PC ya escuchando). Pégalo en WhatsApp y ábrelo en Chrome/Safari.`, "#6ee7b7");
+    rtcLog(`&#9989; Enlace copiado para Sala <b>${rtcSala}</b> (PC escuchando por WSS). Pégalo en WhatsApp y ábrelo en Chrome/Safari.`, "#6ee7b7");
   } catch (_) {
     prompt("Copia este enlace para abrir en tu celular:", url);
   }
 }
 
-// Envía mensajes grandes (SDP > 4KB) en paquetes seguros <= 1.9KB para ntfy.sh
-async function rtcPublicar(sala, obj) {
-  const raw = JSON.stringify({ ...obj, sid: rtcSid, ts: Date.now() });
-  const MAX_CHUNK = 1900;
-  if (raw.length <= MAX_CHUNK) {
-    const r = await fetch(RTC_SIGNAL_BASE + sala, { method: "POST", body: raw });
-    if (!r.ok) throw new Error("Error señalización HTTPS (" + r.status + ")");
-    return;
-  }
-  const cid = Math.random().toString(36).slice(2, 8);
-  const total = Math.ceil(raw.length / MAX_CHUNK);
-  for (let i = 0; i < total; i++) {
-    const chunkPayload = JSON.stringify({
-      _ck: 1, sid: rtcSid, cid, i, n: total,
-      d: raw.slice(i * MAX_CHUNK, (i + 1) * MAX_CHUNK)
-    });
-    const r = await fetch(RTC_SIGNAL_BASE + sala, { method: "POST", body: chunkPayload });
-    if (!r.ok) throw new Error("Error señalización chunk (" + r.status + ")");
-    if (i < total - 1) await new Promise(res => setTimeout(res, 90));
-  }
+function rtcEnviar(obj) {
+  if (!rtcMqtt) return;
+  rtcMqtt.publish(JSON.stringify({ ...obj, sid: rtcSid, ts: Date.now() }));
 }
 
-function rtcReensamblar(envData) {
-  try {
-    const env = JSON.parse(envData);
-    if (!env.message || env.message[0] !== "{") return null;
-    const msg = JSON.parse(env.message);
-    if (!msg || msg.sid === rtcSid) return null;
-    if (msg._ck === 1) {
-      let b = rtcChunkBuf[msg.cid];
-      if (!b) b = rtcChunkBuf[msg.cid] = { n: msg.n, got: 0, parts: new Array(msg.n), ts: Date.now() };
-      if (b.parts[msg.i] === undefined) { b.parts[msg.i] = msg.d; b.got++; }
-      if (b.got === b.n) {
-        const joined = b.parts.join("");
-        delete rtcChunkBuf[msg.cid];
-        const fullMsg = JSON.parse(joined);
-        return (fullMsg && fullMsg.sid !== rtcSid) ? fullMsg : null;
-      }
-      return null;
-    }
-    return msg;
-  } catch (_) {
-    return null;
-  }
-}
-
-function esperarIceCompleto(pc, timeoutMs = 2800) {
+function esperarIceCompleto(pc, timeoutMs = 2600) {
   return new Promise(resolve => {
     if (pc.iceGatheringState === "complete") { resolve(); return; }
     let done = false;
@@ -2714,12 +2803,12 @@ function esperarIceCompleto(pc, timeoutMs = 2800) {
 
 function limpiarSoloConexionRTC() {
   if (rtcRetryTimer) { clearInterval(rtcRetryTimer); rtcRetryTimer = null; }
-  if (rtcEs) { try { rtcEs.close(); } catch (_) {} rtcEs = null; }
+  if (rtcMqtt) { rtcMqtt.close(); rtcMqtt = null; }
   if (rtcPc) { try { rtcPc.close(); } catch (_) {} rtcPc = null; }
   if (rtcLocalStream) { rtcLocalStream.getTracks().forEach(t => t.stop()); rtcLocalStream = null; }
   const vLoc = document.getElementById("vid-rtc-local");
   if (vLoc) { vLoc.srcObject = null; vLoc.style.display = "none"; }
-  rtcOfferCache = null; rtcConnectedOnce = false; rtcChunkBuf = {};
+  rtcOfferCache = null; rtcConnectedOnce = false;
 }
 
 function cerrarWebRTC() {
@@ -2750,74 +2839,75 @@ async function iniciarReceptorPC() {
   document.getElementById("rtc-bar-live").classList.add("show");
   const btn = document.getElementById("btn-rtc");
   if (btn) { btn.className = "btn rtc-on"; btn.innerHTML = `&#128225; WebRTC Sala ${salaActual}`; }
-  rtcLog(`&#128993; PC escuchando en Sala <b>${salaActual}</b>... Escribe <b>${salaActual}</b> en el celular o abre el link copiado.`, "#fde68a");
+  rtcLog(`&#128309; Conectando sala WSS <b>${salaActual}</b>...`, "#7dd3fc");
 
   let procesandoOferta = false;
-  rtcEs = new EventSource(RTC_SIGNAL_BASE + salaActual + "/sse");
-  rtcEs.onopen = () => {
-    rtcPublicar(salaActual, { type: "pc_ready" }).catch(() => {});
-  };
-  rtcEs.onmessage = async (ev) => {
-    const msg = rtcReensamblar(ev.data);
-    if (!msg) return;
-    try {
-      if (msg.type === "offer") {
-        if (procesandoOferta || rtcConnectedOnce) return;
-        procesandoOferta = true;
-        rtcLog(`&#128309; Celular detectado en Sala <b>${salaActual}</b>. Negociando video en vivo...`, "#7dd3fc");
-        if (rtcPc) { try { rtcPc.close(); } catch (_) {} }
-        rtcPc = new RTCPeerConnection(RTC_ICE_CFG);
+  const topic = `siom/weldvision/rtc/${salaActual}`;
+  rtcMqtt = new MiniMqttWss(
+    topic,
+    async (rawText) => {
+      let msg;
+      try { msg = JSON.parse(rawText); } catch (_) { return; }
+      if (!msg || msg.sid === rtcSid) return;
+      try {
+        if (msg.type === "offer") {
+          if (procesandoOferta || rtcConnectedOnce) return;
+          procesandoOferta = true;
+          rtcLog(`&#128309; Celular detectado en Sala <b>${salaActual}</b>. Negociando video en vivo...`, "#7dd3fc");
+          if (rtcPc) { try { rtcPc.close(); } catch (_) {} }
+          rtcPc = new RTCPeerConnection(RTC_ICE_CFG);
 
-        rtcPc.ontrack = async (e) => {
-          const stream = (e.streams && e.streams[0]) ? e.streams[0] : new MediaStream([e.track]);
-          streamCam = stream;
-          const v = document.getElementById("vid-cam");
-          v.srcObject = stream;
-          v.setAttribute("playsinline", "true");
-          try { await v.play(); } catch (_) {}
-          modoCamara = true;
-          camCongelada = false;
-          mostrarBannerCamara("");
-          actualizarUIBotonCamara();
-          actualizarBotonCongelar();
-          rtcConnectedOnce = true;
-          rtcLog(`&#128994; <b>CONECTADO EN VIVO (Celular &#8594; PC)</b> — Sala ${salaActual}. Procesando Ventana A + Ventana B.`, "#6ee7b7");
-          document.getElementById("lbl-status").innerText = `WebRTC en vivo (Cámara Celular -> Sala ${salaActual})`;
-          cerrarModalRTC();
-          bucleCam();
-        };
-
-        rtcPc.oniceconnectionstatechange = () => {
-          const st = rtcPc ? rtcPc.iceConnectionState : "closed";
-          if (st === "connected" || st === "completed") {
+          rtcPc.ontrack = async (e) => {
+            const stream = (e.streams && e.streams[0]) ? e.streams[0] : new MediaStream([e.track]);
+            streamCam = stream;
+            const v = document.getElementById("vid-cam");
+            v.srcObject = stream;
+            v.setAttribute("playsinline", "true");
+            try { await v.play(); } catch (_) {}
+            modoCamara = true;
+            camCongelada = false;
+            mostrarBannerCamara("");
+            actualizarUIBotonCamara();
+            actualizarBotonCongelar();
             rtcConnectedOnce = true;
-            rtcLog(`&#128994; <b>CONECTADO EN VIVO (Celular &#8594; PC)</b> — Sala ${salaActual}.`, "#6ee7b7");
-          } else if (st === "failed" || st === "disconnected") {
-            procesandoOferta = false;
-            rtcLog(`&#128308; Enlace WebRTC caído (${st}). Si estás en WiFi con firewall, conecta tu PC al Hotspot del celular y reconecta.`, "#fca5a5");
-          }
-        };
+            rtcLog(`&#128994; <b>CONECTADO EN VIVO (Celular &#8594; PC)</b> — Sala ${salaActual}. Procesando Ventana A + Ventana B.`, "#6ee7b7");
+            document.getElementById("lbl-status").innerText = `WebRTC en vivo (Cámara Celular -> Sala ${salaActual})`;
+            cerrarModalRTC();
+            bucleCam();
+          };
 
-        await rtcPc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
-        const answer = await rtcPc.createAnswer();
-        await rtcPc.setLocalDescription(answer);
-        await esperarIceCompleto(rtcPc, 2600);
-        await rtcPublicar(salaActual, { type: "answer", to: msg.sid, sdp: rtcPc.localDescription.sdp });
-        rtcLog(`&#128309; Respuesta enviada al celular (Sala <b>${salaActual}</b>). Esperando trama de video...`, "#7dd3fc");
-        // Si en 8s no conectó, permite aceptar una nueva oferta
-        setTimeout(() => { if (!rtcConnectedOnce) procesandoOferta = false; }, 8000);
+          rtcPc.oniceconnectionstatechange = () => {
+            const st = rtcPc ? rtcPc.iceConnectionState : "closed";
+            if (st === "connected" || st === "completed") {
+              rtcConnectedOnce = true;
+              rtcLog(`&#128994; <b>CONECTADO EN VIVO (Celular &#8594; PC)</b> — Sala ${salaActual}.`, "#6ee7b7");
+            } else if (st === "failed" || st === "disconnected") {
+              procesandoOferta = false;
+              rtcLog(`&#128308; Enlace WebRTC caído (${st}). Si el WiFi bloquea UDP, conecta el PC al Hotspot del celular y reconecta.`, "#fca5a5");
+            }
+          };
+
+          await rtcPc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
+          const answer = await rtcPc.createAnswer();
+          await rtcPc.setLocalDescription(answer);
+          await esperarIceCompleto(rtcPc, 2400);
+          rtcEnviar({ type: "answer", to: msg.sid, sdp: rtcPc.localDescription.sdp });
+          rtcLog(`&#128309; Respuesta enviada al celular (Sala <b>${salaActual}</b>). Esperando trama de video...`, "#7dd3fc");
+          setTimeout(() => { if (!rtcConnectedOnce) procesandoOferta = false; }, 7000);
+        }
+      } catch (err) {
+        procesandoOferta = false;
+        rtcLog(`&#128308; Error WebRTC en PC: ${err.message}`, "#fca5a5");
       }
-    } catch (err) {
-      procesandoOferta = false;
-      rtcLog(`&#128308; Error WebRTC en PC: ${err.message}`, "#fca5a5");
+    },
+    () => {
+      rtcLog(`&#128993; PC escuchando en Sala <b>${salaActual}</b> (WSS listo). Escribe <b>${salaActual}</b> en el celular o abre el link.`, "#fde68a");
+      rtcEnviar({ type: "pc_ready" });
+    },
+    (errMsg) => {
+      rtcLog(`&#128308; ${errMsg}`, "#fca5a5");
     }
-  };
-
-  rtcEs.onerror = () => {
-    if (rtcActivo && !rtcConnectedOnce) {
-      rtcLog(`&#9888; Reconectando señalización HTTPS (Sala ${salaActual})...`, "#fde68a");
-    }
-  };
+  );
 }
 
 async function iniciarEmisorCelular() {
@@ -2865,59 +2955,53 @@ async function iniciarEmisorCelular() {
         if (rtcRetryTimer) { clearInterval(rtcRetryTimer); rtcRetryTimer = null; }
         rtcLog(`&#128994; <b>TRANSMITIENDO EN VIVO AL PC</b> — Sala ${rtcSala} (${rtcFacing === "environment" ? "Trasera" : "Frontal"}).`, "#6ee7b7");
       } else if (st === "failed" || st === "disconnected") {
-        rtcLog(`&#128308; Enlace caído (${st}). Si el WiFi bloquea WebRTC, activa el Hotspot del celular y conecta el PC.`, "#fca5a5");
+        rtcLog(`&#128308; Enlace caído (${st}). Si el WiFi bloquea UDP, activa el Hotspot del celular y conecta el PC.`, "#fca5a5");
       }
     };
 
-    rtcLog(`&#128309; Paso 2/3: Empaquetando oferta WebRTC para Sala <b>${rtcSala}</b>...`, "#7dd3fc");
+    rtcLog(`&#128309; Paso 2/3: Preparando oferta WebRTC para Sala <b>${rtcSala}</b>...`, "#7dd3fc");
     const offer = await rtcPc.createOffer();
     await rtcPc.setLocalDescription(offer);
-    await esperarIceCompleto(rtcPc, 2600);
+    await esperarIceCompleto(rtcPc, 2400);
     rtcOfferCache = rtcPc.localDescription.sdp;
 
     let answerAplicada = false;
-    let ofertaEnviada = false;
-    const enviarOferta = async () => {
-      if (!rtcActivo || answerAplicada || !rtcOfferCache) return;
-      await rtcPublicar(rtcSala, { type: "offer", sdp: rtcOfferCache });
-      ofertaEnviada = true;
-    };
-
-    rtcEs = new EventSource(RTC_SIGNAL_BASE + rtcSala + "/sse");
-    rtcEs.onopen = () => {
-      if (!ofertaEnviada) {
-        enviarOferta().then(() => {
-          if (!answerAplicada) rtcLog(`&#128993; Paso 3/3: Oferta enviada a Sala <b>${rtcSala}</b>. Esperando respuesta del PC...`, "#fde68a");
-        }).catch(err => rtcLog(`&#128308; Error enviando oferta: ${err.message}`, "#fca5a5"));
-      }
-    };
-    rtcEs.onmessage = async (ev) => {
-      const msg = rtcReensamblar(ev.data);
-      if (!msg) return;
-      try {
-        if (msg.type === "answer" && msg.to === rtcSid && rtcPc && !answerAplicada) {
-          answerAplicada = true;
-          if (rtcRetryTimer) { clearInterval(rtcRetryTimer); rtcRetryTimer = null; }
-          await rtcPc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
-          rtcLog(`&#128994; Respuesta del PC recibida. Conectando video en vivo...`, "#6ee7b7");
-        } else if (msg.type === "pc_ready" && !answerAplicada) {
-          enviarOferta().catch(() => {});
+    const topic = `siom/weldvision/rtc/${rtcSala}`;
+    rtcMqtt = new MiniMqttWss(
+      topic,
+      async (rawText) => {
+        let msg;
+        try { msg = JSON.parse(rawText); } catch (_) { return; }
+        if (!msg || msg.sid === rtcSid) return;
+        try {
+          if (msg.type === "answer" && msg.to === rtcSid && rtcPc && !answerAplicada) {
+            answerAplicada = true;
+            if (rtcRetryTimer) { clearInterval(rtcRetryTimer); rtcRetryTimer = null; }
+            await rtcPc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
+            rtcLog(`&#128994; Respuesta del PC recibida. Conectando video en vivo...`, "#6ee7b7");
+          } else if (msg.type === "pc_ready" && !answerAplicada && rtcOfferCache) {
+            rtcEnviar({ type: "offer", sdp: rtcOfferCache });
+          }
+        } catch (err) {
+          rtcLog(`&#128308; Error WebRTC en celular: ${err.message}`, "#fca5a5");
         }
-      } catch (err) {
-        rtcLog(`&#128308; Error WebRTC en celular: ${err.message}`, "#fca5a5");
+      },
+      () => {
+        rtcEnviar({ type: "offer", sdp: rtcOfferCache });
+        rtcLog(`&#128993; Paso 3/3: Oferta enviada a Sala <b>${rtcSala}</b> (WSS). Esperando respuesta del PC...`, "#fde68a");
+        let tries = 0;
+        rtcRetryTimer = setInterval(() => {
+          if (!rtcActivo || answerAplicada || tries >= 12) {
+            clearInterval(rtcRetryTimer); rtcRetryTimer = null; return;
+          }
+          tries++;
+          rtcEnviar({ type: "offer", sdp: rtcOfferCache });
+        }, 4000);
+      },
+      (errMsg) => {
+        rtcLog(`&#128308; ${errMsg}`, "#fca5a5");
       }
-    };
-
-    // Respaldo si onopen tarda >800ms y reintento limpio cada 5s (hasta 60s)
-    setTimeout(() => { if (!ofertaEnviada) enviarOferta().catch(() => {}); }, 800);
-    let tries = 0;
-    rtcRetryTimer = setInterval(() => {
-      if (!rtcActivo || answerAplicada || tries >= 12) {
-        clearInterval(rtcRetryTimer); rtcRetryTimer = null; return;
-      }
-      tries++;
-      enviarOferta().catch(() => {});
-    }, 5000);
+    );
   } catch (err) {
     rtcLog(`&#128308; Error al iniciar cámara emisora: ${err.message}`, "#fca5a5");
   }
